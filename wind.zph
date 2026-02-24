@@ -1,0 +1,950 @@
+// ═══════════════════════════════════════════════════════════
+//  wind — An AUR helper for Arch Linux, written in Zephyr
+//  Usage: wind [operation] [options] [packages...]
+//
+//  Operations:
+//    -S, --sync         Install/sync packages (AUR + official)
+//    -R, --remove       Remove packages
+//    -U, --upgrade      Upgrade all AUR packages
+//    -Ss, --search      Search AUR
+//    -Si, --info        Show package info
+//    -Ql, --list        List files owned by package
+//    -Qm, --foreign     List AUR-installed packages
+//    -h, --help         Show help
+//
+//  Examples:
+//    wind -S yay            install a package
+//    wind -Ss browser       search for packages
+//    wind -Si firefox-bin   show package info
+//    wind -U                upgrade all AUR packages
+//    wind -R old-package    remove a package
+//    wind -Qm               list foreign (AUR) packages
+// ═══════════════════════════════════════════════════════════
+
+// ── ANSI colours ────────────────────────────────────────────────────────────
+
+// Get the ESC character via printf since Zephyr doesn't interpolate escape codes
+let ESC    = match exec("printf '\\033'") { Ok(s) => s  Err(_) => "" }
+let RESET  = "#{ESC}[0m"
+let BOLD   = "#{ESC}[1m"
+let RED    = "#{ESC}[31m"
+let GREEN  = "#{ESC}[32m"
+let YELLOW = "#{ESC}[33m"
+let BLUE   = "#{ESC}[34m"
+let MAGENTA= "#{ESC}[35m"
+let CYAN   = "#{ESC}[36m"
+let WHITE  = "#{ESC}[37m"
+let DIM    = "#{ESC}[2m"
+
+// ── Banner ───────────────────────────────────────────────────────────────────
+
+fun print_banner() {
+    println("#{CYAN}#{BOLD}")
+    println("  ██╗    ██╗██╗███╗   ██╗██████╗ ")
+    println("  ██║    ██║██║████╗  ██║██╔══██╗")
+    println("  ██║ █╗ ██║██║██╔██╗ ██║██║  ██║")
+    println("  ██║███╗██║██║██║╚██╗██║██║  ██║")
+    println("  ╚███╔███╔╝██║██║ ╚████║██████╔╝")
+    println("   ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝╚═════╝ ")
+    println("#{RESET}#{DIM}  An AUR helper for Arch Linux — v1.0.0#{RESET}")
+    println("")
+}
+
+fun info(msg: String) {
+    println("#{CYAN}::#{RESET} #{BOLD}#{msg}#{RESET}")
+}
+
+fun success(msg: String) {
+    println("#{GREEN}✓#{RESET} #{msg}")
+}
+
+fun warn(msg: String) {
+    println("#{YELLOW}warning:#{RESET} #{msg}")
+}
+
+fun error_msg(msg: String) {
+    println("#{RED}error:#{RESET} #{msg}")
+}
+
+fun prompt(msg: String) -> String {
+    print("#{CYAN}::#{RESET} #{msg} ")
+    input("")
+}
+
+fun confirm(msg: String) -> Bool {
+    let ans = prompt("#{msg} [Y/n]")
+    let trimmed = ans.trim().to_lower()
+    trimmed == "y" || trimmed == "yes" || trimmed == ""
+}
+
+// ── Prerequisite checks ──────────────────────────────────────────────────────
+
+fun check_deps() -> Bool {
+    var ok = true
+    if !exec_ok("which git") {
+        error_msg("git is not installed. Install it with: pacman -S git")
+        ok = false
+    }
+    if !exec_ok("which makepkg") {
+        error_msg("makepkg not found. Are you on Arch Linux?")
+        ok = false
+    }
+    if !exec_ok("which pacman") {
+        error_msg("pacman not found. Wind requires Arch Linux.")
+        ok = false
+    }
+    ok
+}
+
+fun is_root() -> Bool {
+    let res = exec("id -u")
+    match res {
+        Ok(uid) => uid.trim() == "0"
+        Err(_)  => false
+    }
+}
+
+// ── AUR RPC helpers ──────────────────────────────────────────────────────────
+
+let AUR_RPC = "https://aur.archlinux.org/rpc/v5"
+
+fun aur_search(query: String) -> String {
+    let url = "#{AUR_RPC}/search/#{query}?by=name-desc"
+    let res = http_get(url)
+    match res {
+        Ok(body) => body
+        Err(e)   => "{\"error\": \"#{e}\"}"
+    }
+}
+
+fun aur_info(pkgname: String) -> String {
+    let url = "#{AUR_RPC}/info?arg[]=#{pkgname}"
+    let res = http_get(url)
+    match res {
+        Ok(body) => body
+        Err(e)   => "{\"error\": \"#{e}\"}"
+    }
+}
+
+fun aur_info_multi(names: String) -> String {
+    let url = "#{AUR_RPC}/info?#{names}"
+    let res = http_get(url)
+    match res {
+        Ok(body) => body
+        Err(e)   => "{\"error\": \"#{e}\"}"
+    }
+}
+
+// ── Package database helpers ─────────────────────────────────────────────────
+
+fun pacman_installed(pkg: String) -> Bool {
+    exec_ok("pacman -Qi #{pkg}")
+}
+
+fun is_official(pkg: String) -> Bool {
+    exec_ok("pacman -Si #{pkg}")
+}
+
+fun get_installed_version(pkg: String) -> String {
+    let res = exec("pacman -Q #{pkg} 2>/dev/null | awk '{print $2}'")
+    match res {
+        Ok(v) => v.trim()
+        Err(_) => "unknown"
+    }
+}
+
+fun list_foreign_packages() -> String {
+    let res = exec("pacman -Qm")
+    match res {
+        Ok(out) => out
+        Err(_)  => ""
+    }
+}
+
+// ── AUR clone + build ────────────────────────────────────────────────────────
+
+fun get_build_dir() -> String {
+    let cache = env_get("XDG_CACHE_HOME")
+    if cache == nil || cache == "" {
+        let home = env_get("HOME")
+        "#{home}/.cache/wind"
+    } else {
+        "#{cache}/wind"
+    }
+}
+
+fun clone_or_update(pkgname: String, build_dir: String) -> Bool {
+    let pkg_dir = "#{build_dir}/#{pkgname}"
+
+    if dir_exists(pkg_dir) {
+        info("Updating existing clone of #{pkgname}...")
+        let pull = process_run("git", ["pull", "--ff-only"], [], pkg_dir)
+        let ok = pull["ok"]
+        if !ok {
+            let err = pull["stderr"]
+            warn("git pull failed: #{err}")
+            warn("Removing cached clone and re-cloning...")
+            dir_delete_all(pkg_dir)
+        } else {
+            success("Updated #{pkgname}")
+            return true
+        }
+    }
+
+    info("Cloning #{pkgname} from AUR...")
+    let url = "https://aur.archlinux.org/#{pkgname}.git"
+    let clone = shell("git", ["clone", "--depth", "1", url, pkg_dir])
+    let clone_ok = clone["ok"]
+    if !clone_ok {
+        let err = clone["stderr"]
+        error_msg("Failed to clone #{pkgname}: #{err}")
+        return false
+    }
+    success("Cloned #{pkgname}")
+    true
+}
+
+fun show_pkgbuild(pkg_dir: String) -> Bool {
+    let pkgbuild_path = "#{pkg_dir}/PKGBUILD"
+    if !file_exists(pkgbuild_path) {
+        return false
+    }
+    println("")
+    println("#{BOLD}#{YELLOW}==> PKGBUILD for review:#{RESET}")
+    println("#{DIM}────────────────────────────────────────────────#{RESET}")
+    let content = file_read(pkgbuild_path)
+    match content {
+        Ok(text) => {
+            // Print first 60 lines to avoid overwhelming the terminal
+            let lines = text.split("\n")
+            var count = 0
+            for line in lines {
+                if count < 60 {
+                    println(line)
+                }
+                count = count + 1
+            }
+            if count > 60 {
+                println("#{DIM}... (#{count - 60} more lines, see #{pkgbuild_path})#{RESET}")
+            }
+        }
+        Err(e) => println("#{RED}Could not read PKGBUILD: #{e}#{RESET}")
+    }
+    println("#{DIM}────────────────────────────────────────────────#{RESET}")
+    true
+}
+
+fun build_and_install(pkg_dir: String, pkgname: String, noconfirm: Bool) -> Bool {
+    info("Building #{pkgname}...")
+    println("#{DIM}==> Running makepkg -si#{RESET}")
+    println("")
+
+    var makepkg_args = "makepkg -si"
+    if noconfirm {
+        makepkg_args = "#{makepkg_args} --noconfirm"
+    }
+
+    let result = process_spawn("cd '#{pkg_dir}' && #{makepkg_args}")
+    match result {
+        Ok(0) => {
+            println("")
+            success("#{pkgname} installed successfully!")
+            true
+        }
+        Ok(n) => {
+            println("")
+            error_msg("makepkg exited with code #{n} for #{pkgname}")
+            false
+        }
+        Err(e) => {
+            error_msg("Could not run makepkg: #{e}")
+            false
+        }
+    }
+}
+
+// ── Dependency resolution ─────────────────────────────────────────────────────
+
+fun resolve_aur_deps(pkgname: String) -> [String] {
+    let raw = aur_info(pkgname)
+    let parsed = json_parse(raw)
+    var deps = []
+    match parsed {
+        Ok(data) => {
+            let results = json_get(data, "results")
+            if json_is_array(results) {
+                let count = json_len(results)
+                match count {
+                    Ok(n) if n > 0 => {
+                        let pkg = json_get_path(results, "0")
+                        let make_deps = json_get(pkg, "MakeDepends")
+                        let run_deps  = json_get(pkg, "Depends")
+                        if json_is_array(make_deps) {
+                            let md_count = json_len(make_deps)
+                            match md_count {
+                                Ok(c) => {
+                                    for i in 0..c {
+                                        let d = json_get_path(make_deps, "#{i}")
+                                        push(deps, str(d))
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        if json_is_array(run_deps) {
+                            let rd_count = json_len(run_deps)
+                            match rd_count {
+                                Ok(c) => {
+                                    for i in 0..c {
+                                        let d = json_get_path(run_deps, "#{i}")
+                                        push(deps, str(d))
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    deps
+}
+
+fun install_missing_deps(deps: [String]) {
+    var aur_deps = []
+    var official_deps = []
+
+    for dep in deps {
+        // Strip version specifiers (e.g. "foo>=1.0" -> "foo")
+        let clean = dep.split(">=")[0].split("<=")[0].split("=")[0].split(">")[0].split("<")[0].trim()
+        if !pacman_installed(clean) {
+            if is_official(clean) {
+                push(official_deps, clean)
+            } else {
+                push(aur_deps, clean)
+            }
+        }
+    }
+
+    if official_deps.len() > 0 {
+        let dep_str = official_deps.join(" ")
+        info("Installing official dependencies: #{dep_str}")
+        let res = process_spawn("sudo pacman -S --needed --noconfirm #{dep_str}")
+        match res {
+            Ok(0) => success("Official dependencies installed")
+            Ok(n) => warn("pacman exited #{n} for official deps")
+            Err(e) => warn("Could not install official deps: #{e}")
+        }
+    }
+
+    if aur_deps.len() > 0 {
+        for dep in aur_deps {
+            info("AUR dependency needed: #{dep}")
+            install_package(dep, true, true)
+        }
+    }
+}
+
+// ── Core install flow ─────────────────────────────────────────────────────────
+
+fun install_package(pkgname: String, noconfirm: Bool, is_dep: Bool) -> Bool {
+    // Check if already installed
+    if pacman_installed(pkgname) {
+        success("#{pkgname} is already installed")
+        return true
+    }
+
+    // Check if it's an official package first
+    if is_official(pkgname) {
+        info("#{pkgname} is in the official repositories")
+        let nc_flag = if noconfirm { "--noconfirm" } else { "" }
+        let res = process_spawn("sudo pacman -S #{nc_flag} #{pkgname}")
+        match res {
+            Ok(0) => {
+                success("#{pkgname} installed from official repos")
+                return true
+            }
+            Ok(_) => {
+                error_msg("Failed to install #{pkgname} from official repos")
+                return false
+            }
+            Err(e) => {
+                error_msg("pacman error: #{e}")
+                return false
+            }
+        }
+    }
+
+    // AUR install
+    let label = if is_dep { "AUR dependency" } else { "AUR package" }
+    println("")
+    println("#{BOLD}#{MAGENTA}==>#{RESET} #{BOLD}#{label}: #{pkgname}#{RESET}")
+
+    // Look up AUR info
+    let raw = aur_info(pkgname)
+    let parsed = json_parse(raw)
+    match parsed {
+        Err(e) => {
+            error_msg("Could not fetch AUR info for #{pkgname}: #{e}")
+            return false
+        }
+        Ok(data) => {
+            let err_field = json_get(data, "error")
+            if str(err_field) != "nil" && str(err_field) != "" {
+                error_msg("AUR error: #{err_field}")
+                return false
+            }
+            let count = json_get(data, "resultcount")
+            if str(count) == "0" || str(count) == "nil" {
+                error_msg("Package '#{pkgname}' not found in AUR")
+                return false
+            }
+        }
+    }
+
+    let build_dir = get_build_dir()
+    dir_create(build_dir)
+
+    // Clone / update
+    let cloned = clone_or_update(pkgname, build_dir)
+    if !cloned {
+        return false
+    }
+
+    let pkg_dir = "#{build_dir}/#{pkgname}"
+
+    // Show PKGBUILD + ask to proceed (unless noconfirm or dep)
+    if !noconfirm && !is_dep {
+        show_pkgbuild(pkg_dir)
+        println("")
+        let proceed = confirm("Proceed with installation of #{pkgname}?")
+        if !proceed {
+            warn("Skipping #{pkgname}")
+            return false
+        }
+    }
+
+    // Install missing deps
+    let deps = resolve_aur_deps(pkgname)
+    if deps.len() > 0 {
+        info("Checking dependencies...")
+        install_missing_deps(deps)
+    }
+
+    // Build and install
+    build_and_install(pkg_dir, pkgname, noconfirm)
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+
+fun cmd_search(query: String) {
+    info("Searching AUR for '#{query}'...")
+    let raw = aur_search(query)
+    let parsed = json_parse(raw)
+    match parsed {
+        Err(e) => {
+            error_msg("Failed to search AUR: #{e}")
+            return
+        }
+        Ok(data) => {
+            let err_field = json_get(data, "error")
+            if str(err_field) != "nil" && str(err_field) != "" {
+                error_msg("AUR error: #{err_field}")
+                return
+            }
+            let results = json_get(data, "results")
+            if !json_is_array(results) {
+                println("No results found for '#{query}'")
+                return
+            }
+            let count = json_len(results)
+            match count {
+                Err(e) => error_msg("Result count error: #{e}")
+                Ok(0)  => println("No results found for '#{query}'")
+                Ok(n)  => {
+                    println("#{BOLD}Found #{n} results:#{RESET}")
+                    println("")
+                    // Show up to 20 results
+                    var limit = n
+                    if n > 20 {
+                        limit = 20
+                    }
+                    for i in 0..limit {
+                        let pkg         = json_get_path(results, "#{i}")
+                        let name        = str(json_get(pkg, "Name"))
+                        let version     = str(json_get(pkg, "Version"))
+                        let description = str(json_get(pkg, "Description"))
+                        let votes       = str(json_get(pkg, "NumVotes"))
+                        let popularity  = str(json_get(pkg, "Popularity"))
+                        let out_of_date = json_get(pkg, "OutOfDate")
+
+                        let installed = pacman_installed(name)
+                        let inst_mark = if installed { "#{GREEN}[installed]#{RESET} " } else { "" }
+                        let ood_mark  = if str(out_of_date) != "nil" { " #{RED}[out-of-date]#{RESET}" } else { "" }
+
+                        println("#{MAGENTA}aur/#{RESET}#{BOLD}#{name}#{RESET} #{GREEN}#{version}#{RESET} #{inst_mark}#{ood_mark}")
+                        println("    #{DIM}Votes: #{votes}  Popularity: #{popularity}#{RESET}")
+                        println("    #{description}")
+                        println("")
+                    }
+                    if n > 20 {
+                        println("#{DIM}... and #{n - 20} more results (refine your search)#{RESET}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Info ──────────────────────────────────────────────────────────────────────
+
+fun cmd_info(pkgname: String) {
+    info("Fetching info for '#{pkgname}'...")
+    let raw = aur_info(pkgname)
+    let parsed = json_parse(raw)
+    match parsed {
+        Err(e) => error_msg("Failed to fetch info: #{e}")
+        Ok(data) => {
+            let results = json_get(data, "results")
+            let count = json_len(results)
+            match count {
+                Ok(0) => println("Package '#{pkgname}' not found in AUR")
+                Ok(_) => {
+                    let pkg = json_get_path(results, "0")
+
+                    fun field(label: String, key: String) {
+                        let val = json_get(pkg, key)
+                        let s   = str(val)
+                        if s != "nil" && s != "" {
+                            println("#{BOLD}#{label.trim_end()}#{RESET} : #{s}")
+                        }
+                    }
+
+                    println("")
+                    println("#{BOLD}#{CYAN}AUR Package Information#{RESET}")
+                    println("#{DIM}────────────────────────────────────────────────#{RESET}")
+                    field("Name           ", "Name")
+                    field("Version        ", "Version")
+                    field("Description    ", "Description")
+                    field("URL            ", "URL")
+                    field("License        ", "License")
+                    field("Maintainer     ", "Maintainer")
+                    field("Votes          ", "NumVotes")
+                    field("Popularity     ", "Popularity")
+                    field("First Submitted", "FirstSubmitted")
+                    field("Last Modified  ", "LastModified")
+                    field("Out of Date    ", "OutOfDate")
+
+                    let depends = json_get(pkg, "Depends")
+                    if json_is_array(depends) {
+                        let c = json_len(depends)
+                        match c {
+                            Ok(n) if n > 0 => {
+                                var deps = []
+                                for i in 0..n {
+                                    push(deps, str(json_get_path(depends, "#{i}")))
+                                }
+                                let deps_str = deps.join(", ")
+                                println("#{BOLD}Depends        #{RESET} : #{deps_str}")
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let make_depends = json_get(pkg, "MakeDepends")
+                    if json_is_array(make_depends) {
+                        let c = json_len(make_depends)
+                        match c {
+                            Ok(n) if n > 0 => {
+                                var mdeps = []
+                                for i in 0..n {
+                                    push(mdeps, str(json_get_path(make_depends, "#{i}")))
+                                }
+                                let mdeps_str = mdeps.join(", ")
+                                println("#{BOLD}Make Depends   #{RESET} : #{mdeps_str}")
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let installed = pacman_installed(pkgname)
+                    if installed {
+                        let local_ver = get_installed_version(pkgname)
+                        println("#{BOLD}Installed      #{RESET} : #{GREEN}Yes (#{local_ver})#{RESET}")
+                    } else {
+                        println("#{BOLD}Installed      #{RESET} : #{DIM}No#{RESET}")
+                    }
+
+                    println("#{DIM}────────────────────────────────────────────────#{RESET}")
+                    let name = str(json_get(pkg, "Name"))
+                    println("AUR page: #{CYAN}https://aur.archlinux.org/packages/#{name}#{RESET}")
+                    println("")
+                }
+                Err(e) => error_msg("json_len error: #{e}")
+            }
+        }
+    }
+}
+
+// ── Sync (install) ────────────────────────────────────────────────────────────
+
+fun cmd_sync(packages: [String], noconfirm: Bool) {
+    if packages.len() == 0 {
+        error_msg("No packages specified. Usage: wind -S <package>")
+        return
+    }
+
+    var failed = []
+
+    for pkgname in packages {
+        let ok = install_package(pkgname.trim(), noconfirm, false)
+        if !ok {
+            push(failed, pkgname)
+        }
+    }
+
+    println("")
+    if failed.len() == 0 {
+        success("All packages processed successfully!")
+    } else {
+        let failed_str = failed.join(", ")
+        error_msg("Failed to install: #{failed_str}")
+    }
+}
+
+// ── Remove ────────────────────────────────────────────────────────────────────
+
+fun cmd_remove(packages: [String], noconfirm: Bool) {
+    if packages.len() == 0 {
+        error_msg("No packages specified. Usage: wind -R <package>")
+        return
+    }
+
+    let pkg_str = packages.join(" ")
+    info("Removing #{pkg_str}...")
+
+    var flags = "-Rs"
+    if noconfirm {
+        flags = "#{flags} --noconfirm"
+    }
+
+    let res = process_spawn("sudo pacman #{flags} #{pkg_str}")
+    match res {
+        Ok(0) => success("Removed: #{pkg_str}")
+        Ok(n) => error_msg("pacman exited #{n}")
+        Err(e) => error_msg("Remove failed: #{e}")
+    }
+}
+
+// ── Upgrade ───────────────────────────────────────────────────────────────────
+
+fun cmd_upgrade(noconfirm: Bool) {
+    info("Checking for AUR upgrades...")
+
+    // First, upgrade official packages
+    info("Upgrading official packages via pacman...")
+    var pacman_flags = "sudo pacman -Syu"
+    if noconfirm {
+        pacman_flags = "#{pacman_flags} --noconfirm"
+    }
+    let pacman_res = process_spawn(pacman_flags)
+    match pacman_res {
+        Ok(0) => success("Official packages upgraded")
+        Ok(n) => warn("pacman -Syu exited #{n}")
+        Err(e) => warn("pacman upgrade failed: #{e}")
+    }
+
+    // Get list of AUR packages
+    let foreign_raw = list_foreign_packages()
+    if foreign_raw == "" {
+        info("No foreign (AUR) packages installed")
+        return
+    }
+
+    let lines = foreign_raw.split("\n")
+    var upgradeable = []
+    var checked = 0
+
+    println("")
+    info("Checking #{lines.len()} AUR packages for updates...")
+
+    // Build bulk query args
+    var query_args = ""
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed != "" {
+            let parts = trimmed.split(" ")
+            if parts.len() >= 1 {
+                let pkgname = parts[0]
+                if query_args == "" {
+                    query_args = "arg[]=#{ pkgname}"
+                } else {
+                    query_args = "#{query_args}&arg[]=#{pkgname}"
+                }
+            }
+        }
+    }
+
+    // Fetch all AUR info in one request
+    if query_args != "" {
+        let raw = aur_info_multi(query_args)
+        let parsed = json_parse(raw)
+        match parsed {
+            Ok(data) => {
+                let results = json_get(data, "results")
+                if json_is_array(results) {
+                    let count = json_len(results)
+                    match count {
+                        Ok(n) => {
+                            for i in 0..n {
+                                let pkg         = json_get_path(results, "#{i}")
+                                let pkgname     = str(json_get(pkg, "Name"))
+                                let aur_version = str(json_get(pkg, "Version"))
+                                let local_ver   = get_installed_version(pkgname)
+
+                                if local_ver != aur_version && local_ver != "unknown" {
+                                    push(upgradeable, pkgname)
+                                    println("  #{YELLOW}#{pkgname}#{RESET}: #{DIM}#{local_ver}#{RESET} → #{GREEN}#{aur_version}#{RESET}")
+                                }
+                                checked = checked + 1
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(e) => warn("Failed to fetch AUR info: #{e}")
+        }
+    }
+
+    if upgradeable.len() == 0 {
+        println("")
+        success("All AUR packages are up to date!")
+        return
+    }
+
+    println("")
+    let upgradeable_str = upgradeable.join(", ")
+    println("#{BOLD}#{upgradeable.len()} AUR package(s) to upgrade:#{RESET} #{upgradeable_str}")
+    println("")
+
+    let proceed = if noconfirm { true } else { confirm("Proceed with upgrade?") }
+    if !proceed {
+        warn("Upgrade cancelled")
+        return
+    }
+
+    for pkgname in upgradeable {
+        println("")
+        println("#{BOLD}#{MAGENTA}==>#{RESET} Upgrading #{BOLD}#{pkgname}#{RESET}")
+        let build_dir = get_build_dir()
+        dir_create(build_dir)
+        let cloned = clone_or_update(pkgname, build_dir)
+        if cloned {
+            let pkg_dir = "#{build_dir}/#{pkgname}"
+            let built = build_and_install(pkg_dir, pkgname, noconfirm)
+            if !built {
+                warn("Failed to upgrade #{pkgname}")
+            }
+        }
+    }
+
+    println("")
+    success("AUR upgrade complete!")
+}
+
+// ── List AUR packages ─────────────────────────────────────────────────────────
+
+fun cmd_list_foreign() {
+    let raw = list_foreign_packages()
+    if raw == "" {
+        println("No foreign (AUR) packages installed")
+        return
+    }
+    println("#{BOLD}Installed AUR packages:#{RESET}")
+    println("")
+    let lines = raw.split("\n")
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed != "" {
+            let parts = trimmed.split(" ")
+            if parts.len() >= 2 {
+                let name    = parts[0]
+                let version = parts[1]
+                println("  #{MAGENTA}#{name}#{RESET} #{GREEN}#{version}#{RESET}")
+            }
+        }
+    }
+}
+
+// ── List files owned by package ───────────────────────────────────────────────
+
+fun cmd_list_files(pkgname: String) {
+    let res = exec("pacman -Ql #{pkgname} 2>&1")
+    match res {
+        Ok(out) => println(out)
+        Err(e)  => error_msg("#{e}")
+    }
+}
+
+// ── Help ──────────────────────────────────────────────────────────────────────
+
+fun print_help() {
+    println("")
+    println("#{BOLD}#{CYAN}wind#{RESET} #{BOLD}— AUR helper for Arch Linux#{RESET}")
+    println("")
+    println("#{BOLD}USAGE:#{RESET}")
+    println("  wind <operation> [options] [packages...]")
+    println("")
+    println("#{BOLD}OPERATIONS:#{RESET}")
+    println("  #{BOLD}-S#{RESET}, #{BOLD}--sync#{RESET} <pkg...>     Install package(s) from AUR or official repos")
+    println("  #{BOLD}-R#{RESET}, #{BOLD}--remove#{RESET} <pkg...>   Remove package(s)")
+    println("  #{BOLD}-U#{RESET}, #{BOLD}--upgrade#{RESET}           Upgrade all packages (pacman -Syu + AUR)")
+    println("  #{BOLD}-Ss#{RESET}, #{BOLD}--search#{RESET} <query>   Search AUR for packages")
+    println("  #{BOLD}-Si#{RESET}, #{BOLD}--info#{RESET} <pkg>       Show detailed package information")
+    println("  #{BOLD}-Qm#{RESET}, #{BOLD}--foreign#{RESET}          List installed AUR packages")
+    println("  #{BOLD}-Ql#{RESET}, #{BOLD}--list#{RESET} <pkg>       List files owned by package")
+    println("  #{BOLD}-h#{RESET}, #{BOLD}--help#{RESET}              Show this help message")
+    println("")
+    println("#{BOLD}OPTIONS:#{RESET}")
+    println("  #{BOLD}--noconfirm#{RESET}            Skip all confirmation prompts")
+    println("")
+    println("#{BOLD}EXAMPLES:#{RESET}")
+    println("  wind -S yay                  Install yay from AUR")
+    println("  wind -S firefox-bin nerd-fonts-complete")
+    println("  wind -Ss python ide          Search for Python IDEs in AUR")
+    println("  wind -Si paru-bin            Show info about paru-bin")
+    println("  wind -U                      Upgrade everything")
+    println("  wind -U --noconfirm          Upgrade without prompts")
+    println("  wind -R old-package          Remove a package")
+    println("  wind -Qm                     List all AUR-installed packages")
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// Main entrypoint — parse args and dispatch
+// ═══════════════════════════════════════════════════════════
+
+fun main() {
+    print_banner()
+
+    if is_root() {
+        error_msg("Do not run wind as root. It will use sudo when needed.")
+        exit(1)
+    }
+
+    if !check_deps() {
+        exit(1)
+    }
+
+    // Zephyr doesn't expose argv directly. Two supported methods:
+    // 1. WIND_ARGS env var: WIND_ARGS="-S firefox" zephyr wind.zph
+    // 2. Interactive prompt (fallback)
+    var argv = []
+
+    let args_raw = env_get("WIND_ARGS")
+    if args_raw != nil && args_raw.trim() != "" {
+        for token in args_raw.trim().split(" ") {
+            let t = token.trim()
+            if t != "" {
+                push(argv, t)
+            }
+        }
+    }
+
+    // Fall back to interactive prompt if no args provided
+    if argv.len() == 0 {
+        print_help()
+        println("#{BOLD}Interactive mode#{RESET} — set WIND_ARGS env var to pass args non-interactively")
+        println("#{DIM}  e.g.  WIND_ARGS='-S firefox' zephyr wind.zph#{RESET}")
+        println("")
+        let line = prompt("Enter command (e.g. -S firefox, -Ss query, -Syu):")
+        // Split the input line into tokens
+        for token in line.trim().split(" ") {
+            let t = token.trim()
+            if t != "" {
+                push(argv, t)
+            }
+        }
+    }
+
+    // Parse operation flag
+    let op = if argv.len() > 0 && argv[0] != nil { argv[0] } else { "--help" }
+
+    // Collect package names and flags
+    var packages = []
+    var noconfirm = false
+
+    var i = 1
+    while i < argv.len() {
+        let a = argv[i]
+        if a == nil {
+            i = i + 1
+            continue
+        }
+        if a == "--noconfirm" {
+            noconfirm = true
+        } elif a.starts_with("-") && a.len() > 2 && !a.starts_with("--") {
+            // Compound flag like -Syu — ignore sub-flags for now
+        } else {
+            push(packages, a)
+        }
+        i = i + 1
+    }
+
+    match op {
+        "-S" | "--sync" => cmd_sync(packages, noconfirm)
+
+        "-R" | "--remove" => cmd_remove(packages, noconfirm)
+
+        "-U" | "--upgrade" | "-Syu" => cmd_upgrade(noconfirm)
+
+        "-Ss" | "--search" => {
+            if packages.len() == 0 {
+                error_msg("Provide a search query: wind -Ss <query>")
+            } else {
+                cmd_search(packages.join(" "))
+            }
+        }
+
+        "-Si" | "--info" => {
+            if packages.len() == 0 {
+                error_msg("Provide a package name: wind -Si <package>")
+            } else {
+                cmd_info(packages[0])
+            }
+        }
+
+        "-Qm" | "--foreign" => cmd_list_foreign()
+
+        "-Ql" | "--list" => {
+            if packages.len() == 0 {
+                error_msg("Provide a package name: wind -Ql <package>")
+            } else {
+                cmd_list_files(packages[0])
+            }
+        }
+
+        "-h" | "--help" => print_help()
+
+        _ => {
+            // If the op looks like a package name (no leading dash), treat as -S
+            if op != nil && !op.starts_with("-") {
+                var pkgs = [op]
+                for pkg in packages {
+                    push(pkgs, pkg)
+                }
+                cmd_sync(pkgs, noconfirm)
+            } else {
+                error_msg("Unknown operation: #{op}")
+                print_help()
+                exit(1)
+            }
+        }
+    }
+}
+
+main()
